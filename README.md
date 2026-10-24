@@ -71,3 +71,5 @@ SQLite-файл и изображения должны храниться на �
 - Build command: `npm install`, Start command: `npm start`.
 - Переменные: `NODE_ENV=production`, `SESSION_SECRET` (24+ символа), `ADMIN_PASSWORD` (10+ символов), `ADMIN_USERNAME`.
 - Для сохранения данных между деплоями подключите Persistent Disk и задайте `DATA_DIR=/var/data/data`, `UPLOAD_DIR=/var/data/uploads`. Без диска база и загрузки обнуляются при каждом деплое.
+
+- Если `SESSION_SECRET` и `ADMIN_PASSWORD` не заданы, сервер сам создаст секрет сессии (файл `session.secret` в `DATA_DIR`) и случайный пароль администратора и один раз выведет его в лог при первом запуске. Явно заданные слабые значения в production по-прежнему блокируют запуск.

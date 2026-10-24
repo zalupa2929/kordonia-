@@ -15,27 +15,36 @@ const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || "./uploads");
 
-// ---------- Проверка секретов ----------
-const DEFAULT_SECRET = "development-only-change-me";
-const DEFAULT_ADMIN_PASS = "change-this-immediately";
-const SESSION_SECRET = process.env.SESSION_SECRET || DEFAULT_SECRET;
-const ADMIN_NAME = process.env.ADMIN_USERNAME || "admin";
-const ADMIN_PASS = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASS;
-const weakSecret = SESSION_SECRET === DEFAULT_SECRET || SESSION_SECRET.startsWith("replace-this") || SESSION_SECRET.length < 24;
-const weakPass = ADMIN_PASS === DEFAULT_ADMIN_PASS || ADMIN_PASS.length < 10;
-if (IS_PROD && (weakSecret || weakPass)) {
-  console.error("ОШИБКА: в production заданы неподходящие переменные окружения:");
-  if (weakSecret) console.error(" - SESSION_SECRET " + (process.env.SESSION_SECRET ? "слишком короткий (нужно 24+ символа) или стандартный" : "НЕ ЗАДАН"));
-  if (weakPass) console.error(" - ADMIN_PASSWORD " + (process.env.ADMIN_PASSWORD ? "слишком короткий (нужно 10+ символов) или стандартный" : "НЕ ЗАДАН"));
-  console.error("Добавьте их в Render → Environment и перезапустите деплой.");
-  process.exit(1);
-}
-if (!IS_PROD && (weakSecret || weakPass)) {
-  console.warn("ВНИМАНИЕ: используются слабые/стандартные SESSION_SECRET или ADMIN_PASSWORD. Допустимо только для локальной проверки.");
-}
-
+// ---------- Секреты ----------
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const DEFAULT_SECRET = "development-only-change-me";
+const DEFAULT_ADMIN_PASS = "change-this-immediately";
+const ENV_SECRET = (process.env.SESSION_SECRET || "").trim();
+const ENV_PASS = process.env.ADMIN_PASSWORD || "";
+const ADMIN_NAME = process.env.ADMIN_USERNAME || "admin";
+// Слабыми считаются только явно заданные стандартные/короткие значения.
+const weakSecret = !!ENV_SECRET && (ENV_SECRET === DEFAULT_SECRET || ENV_SECRET.startsWith("replace-this") || ENV_SECRET.length < 24);
+const weakPass = !!ENV_PASS && (ENV_PASS === DEFAULT_ADMIN_PASS || ENV_PASS.length < 10);
+if (weakSecret || weakPass) {
+  const msg = "заданы слабые значения: " + [weakSecret && "SESSION_SECRET (нужно 24+ символа)", weakPass && "ADMIN_PASSWORD (нужно 10+ символов)"].filter(Boolean).join(", ");
+  if (IS_PROD) { console.error("ОШИБКА: " + msg + ". Исправьте их в Environment или удалите переменные — тогда значения создадутся автоматически."); process.exit(1); }
+  console.warn("ВНИМАНИЕ: " + msg + ". Допустимо только для локальной проверки.");
+}
+// Если SESSION_SECRET не задан — создаём случайный и сохраняем в DATA_DIR.
+function loadSessionSecret() {
+  if (ENV_SECRET) return ENV_SECRET;
+  const f = path.join(DATA_DIR, "session.secret");
+  try { const v = fs.readFileSync(f, "utf8").trim(); if (v.length >= 24) return v; } catch { /* создадим ниже */ }
+  const v = crypto.randomBytes(32).toString("hex");
+  try { fs.writeFileSync(f, v, { mode: 0o600 }); } catch { /* без записи секрет живёт до перезапуска */ }
+  return v;
+}
+const SESSION_SECRET = loadSessionSecret();
+// Если ADMIN_PASSWORD не задан — генерируем случайный пароль и один раз пишем его в лог при создании администратора.
+const GENERATED_ADMIN_PASS = ENV_PASS ? null : crypto.randomBytes(9).toString("base64url");
+const ADMIN_PASS = ENV_PASS || GENERATED_ADMIN_PASS;
+
 const db = new Database(path.join(DATA_DIR, "kordrp.sqlite"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
@@ -132,7 +141,16 @@ const verifyLimiter = makeLimiter(40, 60 * 1000);
 // ---------- Первый администратор ----------
 if (!db.prepare("SELECT id FROM users WHERE username=?").get(ADMIN_NAME)) {
   db.prepare("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)").run(ADMIN_NAME, bcrypt.hashSync(ADMIN_PASS, 12), "main_admin");
-  console.log("Initial admin created from ADMIN_USERNAME / ADMIN_PASSWORD environment variables.");
+  if (GENERATED_ADMIN_PASS) {
+    console.log("==================================================");
+    console.log(" Создан главный администратор (пароль показан один раз):");
+    console.log("   логин:  " + ADMIN_NAME);
+    console.log("   пароль: " + GENERATED_ADMIN_PASS);
+    console.log(" Войдите и сразу смените пароль кнопкой «Сменить пароль».");
+    console.log("==================================================");
+  } else {
+    console.log("Initial admin created from ADMIN_USERNAME / ADMIN_PASSWORD environment variables.");
+  }
 }
 
 // ---------- Middleware ----------
