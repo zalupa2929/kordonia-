@@ -1,7 +1,6 @@
 require("dotenv").config();
 const express = require("express");
 const session = require("express-session");
-const SQLiteStore = require("connect-sqlite3")(session);
 const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 const helmet = require("helmet");
@@ -155,8 +154,32 @@ app.use(helmet({
 }));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
+// Хранилище сессий на better-sqlite3 (без второго нативного модуля sqlite3).
+class SqliteSessionStore extends session.Store {
+  constructor(database) {
+    super();
+    this.db = database;
+    this.db.exec("CREATE TABLE IF NOT EXISTS sessions (sid TEXT PRIMARY KEY, sess TEXT NOT NULL, expires INTEGER NOT NULL)");
+    this.qGet = this.db.prepare("SELECT sess FROM sessions WHERE sid=? AND expires>?");
+    this.qSet = this.db.prepare("INSERT OR REPLACE INTO sessions(sid,sess,expires) VALUES(?,?,?)");
+    this.qDel = this.db.prepare("DELETE FROM sessions WHERE sid=?");
+    this.qTouch = this.db.prepare("UPDATE sessions SET expires=? WHERE sid=?");
+    this.qClean = this.db.prepare("DELETE FROM sessions WHERE expires<=?");
+    const t = setInterval(() => { try { this.qClean.run(Date.now()); } catch { /* ignore */ } }, 15 * 60 * 1000);
+    t.unref();
+  }
+  expiry(sess) {
+    const e = sess && sess.cookie && sess.cookie.expires;
+    return e ? new Date(e).getTime() : Date.now() + 8 * 60 * 60 * 1000;
+  }
+  get(sid, cb) { try { const r = this.qGet.get(sid, Date.now()); cb(null, r ? JSON.parse(r.sess) : null); } catch (e) { cb(e); } }
+  set(sid, sess, cb) { try { this.qSet.run(sid, JSON.stringify(sess), this.expiry(sess)); cb && cb(null); } catch (e) { cb && cb(e); } }
+  destroy(sid, cb) { try { this.qDel.run(sid); cb && cb(null); } catch (e) { cb && cb(e); } }
+  touch(sid, sess, cb) { try { this.qTouch.run(this.expiry(sess), sid); cb && cb(null); } catch (e) { cb && cb(e); } }
+}
+
 app.use(session({
-  store: new SQLiteStore({ db: "sessions.sqlite", dir: DATA_DIR }),
+  store: new SqliteSessionStore(db),
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
