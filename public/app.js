@@ -1,4 +1,4 @@
-let config = { orgs: {}, user: null }, staff = [], history = [], training = [];
+let config = { orgs: {}, user: null }, staff = [], history = [], training = [], requests = [];
 const $ = x => document.getElementById(x);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const today = () => new Date().toISOString().slice(0, 10);
@@ -74,7 +74,8 @@ async function loadPrivate() {
     staff = await api("/api/staff");
     history = await api("/api/history").catch(() => []);
     training = await api("/api/training").catch(() => []);
-    renderStaff(); renderCreds(); renderHistory(); renderTraining();
+    requests = await api("/api/requests").catch(() => []);
+    renderStaff(); renderCreds(); renderHistory(); renderTraining(); renderRequests();
     await renderMyCase();
     if (["main_admin", "technical_admin"].includes(config.user?.role)) { renderUsers(); renderAudit(); }
   } catch (e) { say(e); }
@@ -258,6 +259,64 @@ $("pwForm").onsubmit = async e => {
     $("pwDialog").close();
     alert("Пароль изменён");
   } catch (err) { say(err); }
+};
+
+// ---- Заявки ----
+const RQ_KEY = { "Вступление": "join", "Перевод": "transfer", "Звание": "rank", "Увольнение": "dismiss" };
+function renderRequests() {
+  const pending = requests.filter(r => r.can_decide).length;
+  $("reqTab").textContent = pending ? `Заявки (${pending})` : "Заявки";
+  $("requestList").innerHTML = requests.map(r => {
+    const cls = r.status === "Одобрена" ? "good" : (r.status === "Ожидает" ? "" : "bad");
+    let what = "";
+    if (r.type === "Вступление") what = `${esc(r.fio)} → ${esc(r.org)}, должность: ${esc(r.position)}${r.rank ? ", звание: " + esc(r.rank) : ""}${r.nickname || r.discord ? `<br><span class="muted">${esc(r.nickname || "ник не указан")} · Discord: ${esc(r.discord || "не указан")}</span>` : ""}`;
+    else if (r.type === "Перевод") what = `${esc(r.fio)} → ${esc(r.org)}${r.position ? ", должность: " + esc(r.position) : ""}${r.rank ? ", звание: " + esc(r.rank) : ""}`;
+    else if (r.type === "Звание") what = `${esc(r.fio)} (${esc(r.org)}) → звание: ${esc(r.rank)}`;
+    else what = `${esc(r.fio)} (${esc(r.org)}) — увольнение`;
+    const buttons = [
+      r.can_decide ? `<button class="primary" data-rq-ok="${r.id}">Одобрить</button><button data-rq-no="${r.id}">Отклонить</button>` : "",
+      r.can_cancel ? `<button data-rq-cancel="${r.id}">Отозвать</button>` : ""
+    ].join("");
+    return `<div class="card"><div class="row"><h3>#${r.id} · ${esc(r.type)}</h3><span class="pill ${cls}">${esc(r.status)}</span></div><p>${what}</p>${r.comment ? `<p class="muted">Комментарий: ${esc(r.comment)}</p>` : ""}<p class="muted">Автор: ${esc(r.author)} · ${esc(r.created_at)}</p>${r.decided_by ? `<p class="muted">Решение: ${esc(r.decided_by)}${r.decision_note ? " — " + esc(r.decision_note) : ""}</p>` : ""}${buttons ? `<div class="userrow">${buttons}</div>` : ""}</div>`;
+  }).join("") || '<div class="empty">Заявок пока нет.</div>';
+  document.querySelectorAll("[data-rq-ok]").forEach(b => b.onclick = () => decideRequest(b.dataset.rqOk, true));
+  document.querySelectorAll("[data-rq-no]").forEach(b => b.onclick = () => decideRequest(b.dataset.rqNo, false));
+  document.querySelectorAll("[data-rq-cancel]").forEach(b => b.onclick = async () => {
+    try { await api("/api/requests/" + b.dataset.rqCancel + "/cancel", { method: "POST" }); await loadPrivate(); } catch (e) { say(e); }
+  });
+}
+async function decideRequest(id, approve) {
+  const note = prompt(approve ? "Комментарий к одобрению (можно пусто):" : "Причина отказа (можно пусто):");
+  if (note === null) return;
+  try { await api("/api/requests/" + id + "/decide", { method: "POST", body: JSON.stringify({ approve, note }) }); await loadPrivate(); } catch (e) { say(e); await loadPrivate(); }
+}
+function refreshRqRank() {
+  const type = $("rqType").value;
+  let org = $("rqOrg").value;
+  if (type === "Звание") org = (staff.find(s => s.id === $("rqStaff").value) || {}).org || "";
+  $("rqRank").innerHTML = rankOptions(org, "");
+}
+function updateRequestForm() {
+  const key = RQ_KEY[$("rqType").value];
+  document.querySelectorAll("[data-rq]").forEach(el => el.classList.toggle("hide", !el.dataset.rq.split(" ").includes(key)));
+  $("rqOrgLabel").textContent = key === "transfer" ? "Перевести в организацию" : "Организация";
+  refreshRqRank();
+}
+$("addRequest").onclick = () => {
+  $("requestForm").reset();
+  const orgs = Object.keys(config.orgs);
+  $("rqOrg").innerHTML = orgs.map(x => `<option>${esc(x)}</option>`).join("");
+  $("rqStaff").innerHTML = staff.filter(s => s.status === "Служит").map(s => `<option value="${esc(s.id)}">${esc(s.fio)} — ${esc(s.org)}</option>`).join("");
+  updateRequestForm();
+  $("requestDialog").showModal();
+};
+$("rqType").onchange = updateRequestForm;
+$("rqOrg").onchange = refreshRqRank;
+$("rqStaff").onchange = refreshRqRank;
+$("requestForm").onsubmit = async e => {
+  e.preventDefault();
+  const body = { type: $("rqType").value, comment: $("rqComment").value.trim(), staff_id: $("rqStaff").value, fio: $("rqFio").value.trim(), nickname: $("rqNick").value.trim(), discord: $("rqDiscord").value.trim(), org: $("rqOrg").value, position: $("rqPosition").value.trim(), rank: $("rqRank").value };
+  try { await api("/api/requests", { method: "POST", body: JSON.stringify(body) }); await loadPrivate(); $("requestDialog").close(); } catch (err) { say(err); }
 };
 
 init().catch(say);

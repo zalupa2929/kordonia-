@@ -602,6 +602,145 @@ app.patch("/api/users/:id", role("main_admin"), (req, res) => {
 app.get("/api/audit", role("main_admin", "technical_admin"), (req, res) =>
   res.json(db.prepare("SELECT * FROM access_log ORDER BY id DESC LIMIT 500").all()));
 
+// ---------- Заявки ----------
+const REQ_TYPES = ["Вступление", "Перевод", "Звание", "Увольнение"];
+db.exec(`
+CREATE TABLE IF NOT EXISTS requests (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Ожидает',
+ author TEXT NOT NULL, org TEXT NOT NULL, staff_id TEXT, fio TEXT NOT NULL DEFAULT '', nickname TEXT DEFAULT '', discord TEXT DEFAULT '',
+ position TEXT DEFAULT '', rank TEXT DEFAULT '', comment TEXT DEFAULT '',
+ decided_by TEXT, decided_at TEXT, decision_note TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status);
+`);
+
+function fail(msg) { const e = new Error(msg); e.userMessage = msg; throw e; }
+function newCredentialNo() {
+  let n;
+  do { n = "KR-" + crypto.randomBytes(4).toString("hex").toUpperCase(); }
+  while (db.prepare("SELECT 1 FROM credentials WHERE credential_no=?").get(n));
+  return n;
+}
+// Одобряют: главный администратор (любые заявки) и руководитель организации, к которой относится заявка.
+// Собственную заявку одобрить может только главный администратор.
+function canDecide(u, r) {
+  if (r.status !== "Ожидает") return false;
+  if (u.role === "main_admin") return true;
+  return u.role === "org_head" && u.org === r.org && r.author !== u.username;
+}
+
+function applyRequest(r, actor) {
+  const now = new Date().toISOString();
+  if (r.type === "Вступление") {
+    if (!ORGS[r.org]) fail("Организация больше не существует");
+    if (r.rank && !ORGS[r.org].includes(r.rank)) fail("Звание не относится к организации");
+    let token;
+    do { token = String(crypto.randomInt(0, 1000)).padStart(3, "0") + "-" + String(crypto.randomInt(0, 1000)).padStart(3, "0"); }
+    while (db.prepare("SELECT 1 FROM staff WHERE token=?").get(token));
+    const s = { id: crypto.randomUUID(), fio: r.fio, dob: "", passport: "", phone: "", nickname: r.nickname || "", discord: r.discord || "", token, org: r.org, unit: "", position: r.position, rank: r.rank || "", status: "Служит", portrait_path: "" };
+    db.prepare("INSERT INTO staff(id,fio,dob,passport,phone,nickname,discord,token,org,unit,position,rank,status,portrait_path) VALUES(@id,@fio,@dob,@passport,@phone,@nickname,@discord,@token,@org,@unit,@position,@rank,@status,@portrait_path)").run(s);
+    const no = newCredentialNo();
+    db.prepare("INSERT INTO credentials(staff_id,credential_no,issued_on,expires_on,status,issuer) VALUES(?,?,?,?,?,?)").run(s.id, no, todayStr(), "", "Действует", actor);
+    audit(s, "Приём на службу", "По заявке #" + r.id + ", жетон " + token, actor);
+    audit(s, "Выдача удостоверения", no, actor);
+    return;
+  }
+  const s = staffRow(r.staff_id);
+  if (!s) fail("Сотрудник удалён из реестра");
+  if (r.type === "Перевод") {
+    if (!ORGS[r.org]) fail("Организация больше не существует");
+    if (s.org === r.org) fail("Сотрудник уже состоит в этой организации");
+    if (r.rank && !ORGS[r.org].includes(r.rank)) fail("Звание не относится к организации");
+    const position = r.position || s.position;
+    db.prepare("UPDATE staff SET org=?,position=?,rank=?,updated_at=? WHERE id=?").run(r.org, position, r.rank || "", now, s.id);
+    audit({ ...s, org: r.org }, "Перевод", s.org + " → " + r.org + " (заявка #" + r.id + ")", actor);
+    if ((s.rank || "") !== (r.rank || "")) audit({ ...s, org: r.org }, "Изменение звания", (s.rank || "—") + " → " + (r.rank || "—"), actor);
+  } else if (r.type === "Звание") {
+    if (!r.rank || !ORGS[s.org] || !ORGS[s.org].includes(r.rank)) fail("Звание не относится к организации сотрудника");
+    db.prepare("UPDATE staff SET rank=?,updated_at=? WHERE id=?").run(r.rank, now, s.id);
+    audit(s, "Изменение звания", (s.rank || "—") + " → " + r.rank + " (заявка #" + r.id + ")", actor);
+  } else if (r.type === "Увольнение") {
+    if (s.status === "Уволен") fail("Сотрудник уже уволен");
+    db.prepare("UPDATE staff SET status='Уволен',updated_at=? WHERE id=?").run(now, s.id);
+    db.prepare("UPDATE credentials SET status='Недействительно' WHERE staff_id=?").run(s.id);
+    audit(s, "Увольнение", "По заявке #" + r.id, actor);
+  } else fail("Неизвестный тип заявки");
+}
+
+app.get("/api/requests", auth, (req, res) => {
+  const u = req.session.user;
+  const rows = db.prepare("SELECT * FROM requests ORDER BY id DESC LIMIT 300").all();
+  res.json(rows
+    .filter(r => seesAllOrgs(u) || r.author === u.username || (["org_head", "hr"].includes(u.role) && u.org === r.org))
+    .map(r => ({ ...r, can_decide: canDecide(u, r), can_cancel: r.status === "Ожидает" && r.author === u.username })));
+});
+
+app.post("/api/requests", auth, (req, res) => {
+  const u = req.session.user, b = req.body || {};
+  const type = str(b.type, 20);
+  if (!REQ_TYPES.includes(type)) return res.status(400).json({ error: "Неизвестный тип заявки" });
+  if (db.prepare("SELECT COUNT(*) n FROM requests WHERE author=? AND status='Ожидает'").get(u.username).n >= 10)
+    return res.status(400).json({ error: "У вас уже 10 неотработанных заявок. Дождитесь решения." });
+  const d = { type, author: u.username, org: "", staff_id: null, fio: "", nickname: "", discord: "", position: "", rank: "", comment: str(b.comment, 1000) };
+  if (type === "Вступление") {
+    Object.assign(d, { fio: str(b.fio, 150), nickname: str(b.nickname, 60), discord: str(b.discord, 60), org: str(b.org, 60), position: str(b.position, 100), rank: str(b.rank, 100) });
+    if (!d.fio || !d.position) return res.status(400).json({ error: "Укажите ФИО и желаемую должность" });
+    if (!ORGS[d.org]) return res.status(400).json({ error: "Выберите организацию" });
+    if (d.rank && !ORGS[d.org].includes(d.rank)) return res.status(400).json({ error: "Звание не относится к выбранной организации" });
+  } else {
+    const s = staffRow(String(b.staff_id || ""));
+    if (!s) return res.status(404).json({ error: "Выберите сотрудника" });
+    d.staff_id = s.id; d.fio = s.fio;
+    if (type === "Перевод") {
+      d.org = str(b.org, 60); d.position = str(b.position, 100); d.rank = str(b.rank, 100);
+      if (!ORGS[d.org]) return res.status(400).json({ error: "Выберите организацию, в которую переводят" });
+      if (d.org === s.org) return res.status(400).json({ error: "Сотрудник уже состоит в этой организации" });
+      if (d.rank && !ORGS[d.org].includes(d.rank)) return res.status(400).json({ error: "Звание не относится к выбранной организации" });
+    } else if (type === "Звание") {
+      d.org = s.org; d.rank = str(b.rank, 100);
+      if (!d.rank || !(ORGS[s.org] || []).includes(d.rank)) return res.status(400).json({ error: "Выберите звание из списка организации сотрудника" });
+      if (d.rank === s.rank) return res.status(400).json({ error: "У сотрудника уже это звание" });
+    } else {
+      d.org = s.org;
+      if (s.status === "Уволен") return res.status(400).json({ error: "Сотрудник уже уволен" });
+    }
+  }
+  const info = db.prepare("INSERT INTO requests(type,author,org,staff_id,fio,nickname,discord,position,rank,comment) VALUES(@type,@author,@org,@staff_id,@fio,@nickname,@discord,@position,@rank,@comment)").run(d);
+  log("Подана заявка", "#" + info.lastInsertRowid + " " + type, u.username);
+  res.json({ ok: true, id: info.lastInsertRowid });
+});
+
+app.post("/api/requests/:id/decide", auth, (req, res) => {
+  const u = req.session.user, b = req.body || {};
+  const r = db.prepare("SELECT * FROM requests WHERE id=?").get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: "Заявка не найдена" });
+  if (r.status !== "Ожидает") return res.status(409).json({ error: "Заявка уже обработана" });
+  if (!canDecide(u, r)) return res.status(403).json({ error: "Вы не можете принять решение по этой заявке" });
+  const approve = !!b.approve, note = str(b.note, 500);
+  try {
+    db.transaction(() => {
+      if (approve) applyRequest(r, u.username);
+      db.prepare("UPDATE requests SET status=?,decided_by=?,decided_at=?,decision_note=? WHERE id=?")
+        .run(approve ? "Одобрена" : "Отклонена", u.username, new Date().toISOString(), note, r.id);
+    })();
+  } catch (e) {
+    if (e.userMessage) return res.status(409).json({ error: e.userMessage });
+    if (isUnique(e)) return res.status(409).json({ error: "Конфликт данных, повторите попытку" });
+    throw e;
+  }
+  log(approve ? "Заявка одобрена" : "Заявка отклонена", "#" + r.id + " " + r.type, u.username);
+  res.json({ ok: true });
+});
+
+app.post("/api/requests/:id/cancel", auth, (req, res) => {
+  const u = req.session.user;
+  const r = db.prepare("SELECT * FROM requests WHERE id=?").get(Number(req.params.id));
+  if (!r || r.author !== u.username) return res.status(404).json({ error: "Заявка не найдена" });
+  if (r.status !== "Ожидает") return res.status(409).json({ error: "Заявка уже обработана" });
+  db.prepare("UPDATE requests SET status='Отозвана',decided_by=?,decided_at=? WHERE id=?").run(u.username, new Date().toISOString(), r.id);
+  res.json({ ok: true });
+});
+
 // Неизвестные /api-пути — JSON, а не HTML-страница.
 app.use("/api", (req, res) => res.status(404).json({ error: "Метод не найден" }));
 
