@@ -779,7 +779,7 @@ app.put("/api/profiles/:userId", role("main_admin"), (req, res) => {
 // Неизвестные /api-пути — JSON, а не HTML-страница.
 app.use("/api", (req, res) => res.status(404).json({ error: "Метод не найден" }));
 
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "public"), { setHeaders: res => res.set("Cache-Control", "no-cache") }));
 app.get("*", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
 // Единый обработчик ошибок: всегда JSON.

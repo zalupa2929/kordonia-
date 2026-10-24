@@ -1,5 +1,6 @@
 let config = { orgs: {}, user: null }, staff = [], history = [], training = [];
 const $ = x => document.getElementById(x);
+if ($("ver")) $("ver").textContent += " · js v7";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const today = () => new Date().toISOString().slice(0, 10);
 const safeUrl = u => /^(https?:\/\/[^\s"'<>]+|\/uploads\/[A-Za-z0-9._-]+)$/i.test(u || "") ? u : "";
