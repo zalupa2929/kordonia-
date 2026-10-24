@@ -325,6 +325,13 @@ app.post("/api/login", (req, res) => {
   const key = req.ip + "|" + username.toLowerCase();
   if (loginLimiter.blocked(key)) return res.status(429).json({ error: "Слишком много попыток входа. Подождите 15 минут." });
   const u = db.prepare("SELECT * FROM users WHERE username=? AND active=1").get(username);
+  if (!u) {
+    const rg = db.prepare("SELECT * FROM registrations WHERE username=? AND status<>'Одобрена' ORDER BY id DESC LIMIT 1").get(username);
+    if (rg && rg.password_hash && bcrypt.compareSync(password, rg.password_hash)) {
+      if (rg.status === "Ожидает") return res.status(403).json({ error: "Ваша регистрация ещё на рассмотрении. Дождитесь решения администратора." });
+      return res.status(403).json({ error: "Регистрация отклонена" + (rg.decision_note ? ": " + rg.decision_note : ".") });
+    }
+  }
   if (!u || !bcrypt.compareSync(password, u.password_hash)) {
     loginLimiter.hit(key);
     log("Неудачный вход", username);
@@ -540,8 +547,10 @@ app.get("/api/verify/:token", auth, (req, res) => {
 app.get("/api/my-case", auth, (req, res) => {
   const u = req.session.user;
   const name = u.username.toLowerCase();
+  const prof = profileOf(u.id);
+  let s = prof && prof.token ? db.prepare("SELECT * FROM staff WHERE token=?").get(prof.token) : null;
   // lower() в SQLite не понимает кириллицу, поэтому сравнение делаем в JS.
-  const s = db.prepare("SELECT * FROM staff WHERE nickname<>'' OR discord<>''").all()
+  if (!s) s = db.prepare("SELECT * FROM staff WHERE nickname<>'' OR discord<>''").all()
     .find(x => String(x.nickname || "").toLowerCase() === name || String(x.discord || "").toLowerCase() === name);
   if (!s) return res.json({ found: false });
   const c = credFor(s.id);
@@ -557,7 +566,7 @@ app.get("/api/my-case", auth, (req, res) => {
 app.get("/api/public/organizations", (req, res) => res.json(ORGS));
 
 app.get("/api/users", role("main_admin"), (req, res) =>
-  res.json(db.prepare("SELECT id,username,role,org,active,created_at FROM users ORDER BY username").all()));
+  res.json(db.prepare("SELECT u.id,u.username,u.role,u.org,u.active,u.created_at,p.fio,p.token FROM users u LEFT JOIN profiles p ON p.user_id=u.id ORDER BY u.username").all()));
 
 app.post("/api/users", role("main_admin"), (req, res) => {
   const b = req.body || {};
@@ -602,142 +611,168 @@ app.patch("/api/users/:id", role("main_admin"), (req, res) => {
 app.get("/api/audit", role("main_admin", "technical_admin"), (req, res) =>
   res.json(db.prepare("SELECT * FROM access_log ORDER BY id DESC LIMIT 500").all()));
 
-// ---------- Заявки ----------
-const REQ_TYPES = ["Вступление", "Перевод", "Звание", "Увольнение"];
+// ---------- Регистрация и профили ----------
 db.exec(`
-CREATE TABLE IF NOT EXISTS requests (
- id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Ожидает',
- author TEXT NOT NULL, org TEXT NOT NULL, staff_id TEXT, fio TEXT NOT NULL DEFAULT '', nickname TEXT DEFAULT '', discord TEXT DEFAULT '',
- position TEXT DEFAULT '', rank TEXT DEFAULT '', comment TEXT DEFAULT '',
- decided_by TEXT, decided_at TEXT, decision_note TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS registrations (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, password_hash TEXT NOT NULL,
+ fio TEXT NOT NULL, nickname TEXT NOT NULL DEFAULT '', discord TEXT NOT NULL DEFAULT '', token TEXT NOT NULL DEFAULT '', passport TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'Ожидает', decided_by TEXT, decided_at TEXT, decision_note TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status);
+CREATE INDEX IF NOT EXISTS idx_reg_status ON registrations(status);
+CREATE TABLE IF NOT EXISTS profiles (
+ user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ fio TEXT NOT NULL DEFAULT '', nickname TEXT NOT NULL DEFAULT '', discord TEXT NOT NULL DEFAULT '',
+ token TEXT NOT NULL DEFAULT '', passport TEXT NOT NULL DEFAULT '', avatar_path TEXT NOT NULL DEFAULT '',
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_token ON profiles(token) WHERE token<>'';
 `);
 
-function fail(msg) { const e = new Error(msg); e.userMessage = msg; throw e; }
-function newCredentialNo() {
-  let n;
-  do { n = "KR-" + crypto.randomBytes(4).toString("hex").toUpperCase(); }
-  while (db.prepare("SELECT 1 FROM credentials WHERE credential_no=?").get(n));
-  return n;
-}
-// Одобряют: главный администратор (любые заявки) и руководитель организации, к которой относится заявка.
-// Собственную заявку одобрить может только главный администратор.
-function canDecide(u, r) {
-  if (r.status !== "Ожидает") return false;
-  if (u.role === "main_admin") return true;
-  return u.role === "org_head" && u.org === r.org && r.author !== u.username;
-}
+const USERNAME_RE = /^[\p{L}\p{N}_.-]{3,40}$/u;
+const TOKEN_RE = /^\d{3}-\d{3}$/;
+const registerLimiter = makeLimiter(5, 60 * 60 * 1000);
+// Сравнение логинов без учёта регистра делаем в JS (lower() в SQLite не понимает кириллицу).
+const userNameTaken = name => db.prepare("SELECT username FROM users").all().some(x => x.username.toLowerCase() === name.toLowerCase());
+const pendingNameTaken = name => db.prepare("SELECT username FROM registrations WHERE status='Ожидает'").all().some(x => x.username.toLowerCase() === name.toLowerCase());
 
-function applyRequest(r, actor) {
-  const now = new Date().toISOString();
-  if (r.type === "Вступление") {
-    if (!ORGS[r.org]) fail("Организация больше не существует");
-    if (r.rank && !ORGS[r.org].includes(r.rank)) fail("Звание не относится к организации");
-    let token;
-    do { token = String(crypto.randomInt(0, 1000)).padStart(3, "0") + "-" + String(crypto.randomInt(0, 1000)).padStart(3, "0"); }
-    while (db.prepare("SELECT 1 FROM staff WHERE token=?").get(token));
-    const s = { id: crypto.randomUUID(), fio: r.fio, dob: "", passport: "", phone: "", nickname: r.nickname || "", discord: r.discord || "", token, org: r.org, unit: "", position: r.position, rank: r.rank || "", status: "Служит", portrait_path: "" };
-    db.prepare("INSERT INTO staff(id,fio,dob,passport,phone,nickname,discord,token,org,unit,position,rank,status,portrait_path) VALUES(@id,@fio,@dob,@passport,@phone,@nickname,@discord,@token,@org,@unit,@position,@rank,@status,@portrait_path)").run(s);
-    const no = newCredentialNo();
-    db.prepare("INSERT INTO credentials(staff_id,credential_no,issued_on,expires_on,status,issuer) VALUES(?,?,?,?,?,?)").run(s.id, no, todayStr(), "", "Действует", actor);
-    audit(s, "Приём на службу", "По заявке #" + r.id + ", жетон " + token, actor);
-    audit(s, "Выдача удостоверения", no, actor);
-    return;
-  }
-  const s = staffRow(r.staff_id);
-  if (!s) fail("Сотрудник удалён из реестра");
-  if (r.type === "Перевод") {
-    if (!ORGS[r.org]) fail("Организация больше не существует");
-    if (s.org === r.org) fail("Сотрудник уже состоит в этой организации");
-    if (r.rank && !ORGS[r.org].includes(r.rank)) fail("Звание не относится к организации");
-    const position = r.position || s.position;
-    db.prepare("UPDATE staff SET org=?,position=?,rank=?,updated_at=? WHERE id=?").run(r.org, position, r.rank || "", now, s.id);
-    audit({ ...s, org: r.org }, "Перевод", s.org + " → " + r.org + " (заявка #" + r.id + ")", actor);
-    if ((s.rank || "") !== (r.rank || "")) audit({ ...s, org: r.org }, "Изменение звания", (s.rank || "—") + " → " + (r.rank || "—"), actor);
-  } else if (r.type === "Звание") {
-    if (!r.rank || !ORGS[s.org] || !ORGS[s.org].includes(r.rank)) fail("Звание не относится к организации сотрудника");
-    db.prepare("UPDATE staff SET rank=?,updated_at=? WHERE id=?").run(r.rank, now, s.id);
-    audit(s, "Изменение звания", (s.rank || "—") + " → " + r.rank + " (заявка #" + r.id + ")", actor);
-  } else if (r.type === "Увольнение") {
-    if (s.status === "Уволен") fail("Сотрудник уже уволен");
-    db.prepare("UPDATE staff SET status='Уволен',updated_at=? WHERE id=?").run(now, s.id);
-    db.prepare("UPDATE credentials SET status='Недействительно' WHERE staff_id=?").run(s.id);
-    audit(s, "Увольнение", "По заявке #" + r.id, actor);
-  } else fail("Неизвестный тип заявки");
-}
-
-app.get("/api/requests", auth, (req, res) => {
-  const u = req.session.user;
-  const rows = db.prepare("SELECT * FROM requests ORDER BY id DESC LIMIT 300").all();
-  res.json(rows
-    .filter(r => seesAllOrgs(u) || r.author === u.username || (["org_head", "hr"].includes(u.role) && u.org === r.org))
-    .map(r => ({ ...r, can_decide: canDecide(u, r), can_cancel: r.status === "Ожидает" && r.author === u.username })));
-});
-
-app.post("/api/requests", auth, (req, res) => {
-  const u = req.session.user, b = req.body || {};
-  const type = str(b.type, 20);
-  if (!REQ_TYPES.includes(type)) return res.status(400).json({ error: "Неизвестный тип заявки" });
-  if (db.prepare("SELECT COUNT(*) n FROM requests WHERE author=? AND status='Ожидает'").get(u.username).n >= 10)
-    return res.status(400).json({ error: "У вас уже 10 неотработанных заявок. Дождитесь решения." });
-  const d = { type, author: u.username, org: "", staff_id: null, fio: "", nickname: "", discord: "", position: "", rank: "", comment: str(b.comment, 1000) };
-  if (type === "Вступление") {
-    Object.assign(d, { fio: str(b.fio, 150), nickname: str(b.nickname, 60), discord: str(b.discord, 60), org: str(b.org, 60), position: str(b.position, 100), rank: str(b.rank, 100) });
-    if (!d.fio || !d.position) return res.status(400).json({ error: "Укажите ФИО и желаемую должность" });
-    if (!ORGS[d.org]) return res.status(400).json({ error: "Выберите организацию" });
-    if (d.rank && !ORGS[d.org].includes(d.rank)) return res.status(400).json({ error: "Звание не относится к выбранной организации" });
-  } else {
-    const s = staffRow(String(b.staff_id || ""));
-    if (!s) return res.status(404).json({ error: "Выберите сотрудника" });
-    d.staff_id = s.id; d.fio = s.fio;
-    if (type === "Перевод") {
-      d.org = str(b.org, 60); d.position = str(b.position, 100); d.rank = str(b.rank, 100);
-      if (!ORGS[d.org]) return res.status(400).json({ error: "Выберите организацию, в которую переводят" });
-      if (d.org === s.org) return res.status(400).json({ error: "Сотрудник уже состоит в этой организации" });
-      if (d.rank && !ORGS[d.org].includes(d.rank)) return res.status(400).json({ error: "Звание не относится к выбранной организации" });
-    } else if (type === "Звание") {
-      d.org = s.org; d.rank = str(b.rank, 100);
-      if (!d.rank || !(ORGS[s.org] || []).includes(d.rank)) return res.status(400).json({ error: "Выберите звание из списка организации сотрудника" });
-      if (d.rank === s.rank) return res.status(400).json({ error: "У сотрудника уже это звание" });
-    } else {
-      d.org = s.org;
-      if (s.status === "Уволен") return res.status(400).json({ error: "Сотрудник уже уволен" });
-    }
-  }
-  const info = db.prepare("INSERT INTO requests(type,author,org,staff_id,fio,nickname,discord,position,rank,comment) VALUES(@type,@author,@org,@staff_id,@fio,@nickname,@discord,@position,@rank,@comment)").run(d);
-  log("Подана заявка", "#" + info.lastInsertRowid + " " + type, u.username);
-  res.json({ ok: true, id: info.lastInsertRowid });
-});
-
-app.post("/api/requests/:id/decide", auth, (req, res) => {
-  const u = req.session.user, b = req.body || {};
-  const r = db.prepare("SELECT * FROM requests WHERE id=?").get(Number(req.params.id));
-  if (!r) return res.status(404).json({ error: "Заявка не найдена" });
-  if (r.status !== "Ожидает") return res.status(409).json({ error: "Заявка уже обработана" });
-  if (!canDecide(u, r)) return res.status(403).json({ error: "Вы не можете принять решение по этой заявке" });
-  const approve = !!b.approve, note = str(b.note, 500);
-  try {
-    db.transaction(() => {
-      if (approve) applyRequest(r, u.username);
-      db.prepare("UPDATE requests SET status=?,decided_by=?,decided_at=?,decision_note=? WHERE id=?")
-        .run(approve ? "Одобрена" : "Отклонена", u.username, new Date().toISOString(), note, r.id);
-    })();
-  } catch (e) {
-    if (e.userMessage) return res.status(409).json({ error: e.userMessage });
-    if (isUnique(e)) return res.status(409).json({ error: "Конфликт данных, повторите попытку" });
-    throw e;
-  }
-  log(approve ? "Заявка одобрена" : "Заявка отклонена", "#" + r.id + " " + r.type, u.username);
+// Публичная регистрация: аккаунт НЕ создаётся, пока главный администратор не одобрит заявку.
+app.post("/api/register", (req, res) => {
+  if (req.session.user) return res.status(400).json({ error: "Вы уже вошли в систему" });
+  if (registerLimiter.blocked(req.ip)) return res.status(429).json({ error: "Слишком много регистраций с вашего адреса. Попробуйте позже." });
+  const b = req.body || {};
+  const username = str(b.username, 40), password = String(b.password || "");
+  const d = { fio: str(b.fio, 150), nickname: str(b.nickname, 60), discord: str(b.discord, 60), token: str(b.token, 7), passport: str(b.passport, 30) };
+  if (!USERNAME_RE.test(username)) return res.status(400).json({ error: "Логин: 3–40 символов — буквы, цифры, точка, дефис, подчёркивание (без пробелов)" });
+  if (password.length < 10 || password.length > 64) return res.status(400).json({ error: "Пароль должен быть от 10 до 64 символов" });
+  if (password.toLowerCase() === username.toLowerCase()) return res.status(400).json({ error: "Пароль не должен совпадать с логином" });
+  if (!d.fio) return res.status(400).json({ error: "Укажите ФИО" });
+  if (!d.nickname) return res.status(400).json({ error: "Укажите ник" });
+  if (!d.discord) return res.status(400).json({ error: "Укажите ник в Discord" });
+  if (d.passport.length < 4) return res.status(400).json({ error: "Укажите номер паспорта" });
+  if (d.token && !TOKEN_RE.test(d.token)) return res.status(400).json({ error: "Жетон должен иметь формат 000-000" });
+  if (userNameTaken(username) || pendingNameTaken(username)) return res.status(409).json({ error: "Такой логин уже занят" });
+  if (d.token && (db.prepare("SELECT 1 FROM profiles WHERE token=?").get(d.token) || db.prepare("SELECT 1 FROM registrations WHERE token=? AND status='Ожидает'").get(d.token)))
+    return res.status(409).json({ error: "Этот жетон уже указан в другом профиле" });
+  if (db.prepare("SELECT COUNT(*) n FROM registrations WHERE status='Ожидает'").get().n >= 200)
+    return res.status(503).json({ error: "Приём регистраций временно закрыт: слишком много нерассмотренных. Обратитесь к администратору." });
+  db.prepare("INSERT INTO registrations(username,password_hash,fio,nickname,discord,token,passport) VALUES(?,?,?,?,?,?,?)")
+    .run(username, bcrypt.hashSync(password, 12), d.fio, d.nickname, d.discord, d.token, d.passport);
+  registerLimiter.hit(req.ip);
+  log("Подана регистрация", username, username);
   res.json({ ok: true });
 });
 
-app.post("/api/requests/:id/cancel", auth, (req, res) => {
+app.get("/api/registrations", role("main_admin"), (req, res) => {
+  const rows = db.prepare(`SELECT id,username,fio,nickname,discord,token,passport,status,decided_by,decided_at,decision_note,created_at
+    FROM registrations ORDER BY CASE status WHEN 'Ожидает' THEN 0 ELSE 1 END, id DESC LIMIT 200`).all();
+  const st = db.prepare("SELECT fio,org,status FROM staff WHERE token=?");
+  res.json(rows.map(r => ({ ...r, staff_match: r.token ? (st.get(r.token) || null) : null })));
+});
+
+app.post("/api/registrations/:id/approve", role("main_admin"), (req, res) => {
+  const r = db.prepare("SELECT * FROM registrations WHERE id=?").get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: "Регистрация не найдена" });
+  if (r.status !== "Ожидает") return res.status(409).json({ error: "Регистрация уже обработана" });
+  const b = req.body || {};
+  const roleName = str(b.role, 30) || "viewer", org = str(b.org, 60) || null;
+  if (!USER_ROLES.includes(roleName)) return res.status(400).json({ error: "Неизвестная роль" });
+  if (org && !ORGS[org]) return res.status(400).json({ error: "Неизвестная организация" });
+  if (["org_head", "hr"].includes(roleName) && !org) return res.status(400).json({ error: "Для руководителя и кадровика укажите организацию" });
+  if (userNameTaken(r.username)) return res.status(409).json({ error: "Логин уже занят — отклоните эту регистрацию" });
+  try {
+    db.transaction(() => {
+      const info = db.prepare("INSERT INTO users(username,password_hash,role,org) VALUES(?,?,?,?)").run(r.username, r.password_hash, roleName, org);
+      db.prepare("INSERT INTO profiles(user_id,fio,nickname,discord,token,passport) VALUES(?,?,?,?,?,?)")
+        .run(info.lastInsertRowid, r.fio, r.nickname, r.discord, r.token, r.passport);
+      db.prepare("UPDATE registrations SET status='Одобрена',password_hash='',decided_by=?,decided_at=? WHERE id=?")
+        .run(req.session.user.username, new Date().toISOString(), r.id);
+    })();
+  } catch (e) {
+    if (isUnique(e)) return res.status(409).json({ error: "Логин или жетон уже заняты" });
+    throw e;
+  }
+  log("Регистрация одобрена", r.username + " (" + roleName + ")", req.session.user.username);
+  res.json({ ok: true });
+});
+
+app.post("/api/registrations/:id/reject", role("main_admin"), (req, res) => {
+  const r = db.prepare("SELECT * FROM registrations WHERE id=?").get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: "Регистрация не найдена" });
+  if (r.status !== "Ожидает") return res.status(409).json({ error: "Регистрация уже обработана" });
+  db.prepare("UPDATE registrations SET status='Отклонена',decided_by=?,decided_at=?,decision_note=? WHERE id=?")
+    .run(req.session.user.username, new Date().toISOString(), str((req.body || {}).note, 300), r.id);
+  log("Регистрация отклонена", r.username, req.session.user.username);
+  res.json({ ok: true });
+});
+
+// ---- Профили: ФИО, фото, ник, Discord, жетон, паспорт ----
+const profileOf = userId => db.prepare("SELECT fio,nickname,discord,token,passport,avatar_path FROM profiles WHERE user_id=?").get(userId) || null;
+
+// admin=true — можно менять ФИО и жетон; иначе ФИО можно заполнить только если оно пустое, жетон не меняется.
+function profileInput(b, old, admin) {
+  const pick = (k, max) => b[k] === undefined ? str(old ? old[k] : "", max) : str(b[k], max);
+  const d = { fio: pick("fio", 150), nickname: pick("nickname", 60), discord: pick("discord", 60), token: pick("token", 7), passport: pick("passport", 30) };
+  if (!admin) { d.token = old?.token || ""; if (old?.fio) d.fio = old.fio; }
+  if (d.token && !TOKEN_RE.test(d.token)) return { error: "Жетон должен иметь формат 000-000" };
+  return { d };
+}
+function saveProfile(userId, d) {
+  db.prepare(`INSERT INTO profiles(user_id,fio,nickname,discord,token,passport) VALUES(@user_id,@fio,@nickname,@discord,@token,@passport)
+    ON CONFLICT(user_id) DO UPDATE SET fio=@fio,nickname=@nickname,discord=@discord,token=@token,passport=@passport,updated_at=CURRENT_TIMESTAMP`)
+    .run({ user_id: userId, ...d });
+}
+
+app.get("/api/profile", auth, (req, res) => {
   const u = req.session.user;
-  const r = db.prepare("SELECT * FROM requests WHERE id=?").get(Number(req.params.id));
-  if (!r || r.author !== u.username) return res.status(404).json({ error: "Заявка не найдена" });
-  if (r.status !== "Ожидает") return res.status(409).json({ error: "Заявка уже обработана" });
-  db.prepare("UPDATE requests SET status='Отозвана',decided_by=?,decided_at=? WHERE id=?").run(u.username, new Date().toISOString(), r.id);
+  res.json({ username: u.username, role: u.role, org: u.org, profile: profileOf(u.id), can_edit_identity: u.role === "main_admin" });
+});
+
+app.put("/api/profile", auth, (req, res) => {
+  const u = req.session.user;
+  const r = profileInput(req.body || {}, profileOf(u.id), u.role === "main_admin");
+  if (r.error) return res.status(400).json({ error: r.error });
+  try { saveProfile(u.id, r.d); } catch (e) {
+    if (isUnique(e)) return res.status(409).json({ error: "Этот жетон уже привязан к другому профилю" });
+    throw e;
+  }
+  log("Профиль обновлён", u.username, u.username);
+  res.json({ ok: true });
+});
+
+app.post("/api/profile/avatar", auth, (req, res, next) => {
+  upload.single("image")(req, res, err => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") return res.status(400).json({ error: "Файл больше 3 МБ" });
+      return next(err);
+    }
+    const drop = () => { if (req.file) fs.unlink(req.file.path, () => {}); };
+    if (!req.file) return res.status(400).json({ error: "Выберите JPG, PNG или WEBP до 3 МБ" });
+    if (!looksLikeImage(req.file)) { drop(); return res.status(400).json({ error: "Файл не является допустимым изображением" }); }
+    const uid = req.session.user.id, old = profileOf(uid), p = "/uploads/" + req.file.filename;
+    db.prepare(`INSERT INTO profiles(user_id,avatar_path) VALUES(?,?)
+      ON CONFLICT(user_id) DO UPDATE SET avatar_path=excluded.avatar_path,updated_at=CURRENT_TIMESTAMP`).run(uid, p);
+    if (old) dropUpload(old.avatar_path);
+    log("Обновлено фото профиля", "", req.session.user.username);
+    res.json({ ok: true, avatar_path: p });
+  });
+});
+
+// Главный администратор: просмотр и правка профиля любого пользователя.
+app.get("/api/profiles/:userId", role("main_admin"), (req, res) => {
+  const t = db.prepare("SELECT id,username,role,org FROM users WHERE id=?").get(Number(req.params.userId));
+  if (!t) return res.status(404).json({ error: "Пользователь не найден" });
+  res.json({ user: t, profile: profileOf(t.id) });
+});
+app.put("/api/profiles/:userId", role("main_admin"), (req, res) => {
+  const t = db.prepare("SELECT id,username FROM users WHERE id=?").get(Number(req.params.userId));
+  if (!t) return res.status(404).json({ error: "Пользователь не найден" });
+  const r = profileInput(req.body || {}, profileOf(t.id), true);
+  if (r.error) return res.status(400).json({ error: r.error });
+  try { saveProfile(t.id, r.d); } catch (e) {
+    if (isUnique(e)) return res.status(409).json({ error: "Этот жетон уже привязан к другому профилю" });
+    throw e;
+  }
+  log("Профиль изменён администратором", t.username, req.session.user.username);
   res.json({ ok: true });
 });
 
