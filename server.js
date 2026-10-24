@@ -24,7 +24,10 @@ const ADMIN_PASS = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASS;
 const weakSecret = SESSION_SECRET === DEFAULT_SECRET || SESSION_SECRET.startsWith("replace-this") || SESSION_SECRET.length < 24;
 const weakPass = ADMIN_PASS === DEFAULT_ADMIN_PASS || ADMIN_PASS.length < 10;
 if (IS_PROD && (weakSecret || weakPass)) {
-  console.error("ОШИБКА: в production задайте SESSION_SECRET (24+ символов) и ADMIN_PASSWORD (10+ символов), отличные от значений по умолчанию.");
+  console.error("ОШИБКА: в production заданы неподходящие переменные окружения:");
+  if (weakSecret) console.error(" - SESSION_SECRET " + (process.env.SESSION_SECRET ? "слишком короткий (нужно 24+ символа) или стандартный" : "НЕ ЗАДАН"));
+  if (weakPass) console.error(" - ADMIN_PASSWORD " + (process.env.ADMIN_PASSWORD ? "слишком короткий (нужно 10+ символов) или стандартный" : "НЕ ЗАДАН"));
+  console.error("Добавьте их в Render → Environment и перезапустите деплой.");
   process.exit(1);
 }
 if (!IS_PROD && (weakSecret || weakPass)) {
