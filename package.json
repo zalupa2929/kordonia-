@@ -1,11 +1,11 @@
 {
   "name": "kordrp-personnel-registry",
-  "version": "1.0.0",
+  "version": "8.0.0",
   "private": true,
   "description": "KordRP personnel registry and public service credential verification",
-  "main": "server.js",
+  "main": "boot.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node boot.js"
   },
   "engines": {
     "node": "22.x"
